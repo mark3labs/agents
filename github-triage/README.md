@@ -63,9 +63,10 @@ count as changes, so it never re-triages itself.
 ## Quick start
 
 You need Go and the [BONNIE CLI](https://go-bonnie.dev/installation), a GitHub
-token for the repository (see [Token](#token)), and an
-[OpenRouter](https://openrouter.ai) API key for the default models (or change
-the models, see [Configuration](#configuration)).
+token for the repository (see [Token](#token)), and an API key for the
+provider that serves your models. The defaults are on
+[OpenRouter](https://openrouter.ai); any provider BONNIE supports works (see
+[Configuration](#configuration)).
 
 ```sh
 git clone https://github.com/mark3labs/agents.git
@@ -78,13 +79,14 @@ cd agents/github-triage
    repo: your-org/your-repo
    ```
 
-2. **Set credentials:** copy `.env.example` to `.env` and fill in the two
-   required values. It also lists the optional overrides.
+2. **Set credentials:** copy `.env.example` to `.env`, then fill in
+   `GITHUB_TOKEN` and your model provider's key. It also lists the optional
+   overrides.
 
    ```sh
    cp .env.example .env
    # GITHUB_TOKEN=...        see "Token" below
-   # OPENROUTER_API_KEY=...  chat model and decision model
+   # OPENROUTER_API_KEY=...  or your provider's key, for the models in triage.yaml
    ```
 
 3. **Build and run:**
