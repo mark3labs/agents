@@ -1,0 +1,156 @@
+# github-triage configuration.
+#
+# GITHUB_TOKEN always comes from the environment (or .env), never from this
+# file. It needs Pull requests: write, Issues: write, Actions: write and
+# Metadata: read on the target repository. GITHUB_REPO, TRIAGE_DRY_RUN and
+# TRIAGE_DB override the matching fields below.
+
+repo: owner/name
+
+# Every 10 minutes. Five-field cron, UTC.
+poll_cron: "*/10 * * * *"
+
+# Log intended writes instead of making them. Turn off once the plans in the
+# run console look right. A dry-run triage does not count as done: the PR is
+# triaged again for real when dry_run goes false.
+dry_run: true
+
+# Agent runs started per poll. The rest wait for the next poll, so a large
+# backlog drains gradually.
+max_prs_per_poll: 10
+
+# State lives here, beside the BONNIE journal.
+state_path: .bonnie/triage.db
+
+# Logins treated as maintainers in addition to anyone GitHub reports as
+# OWNER, MEMBER or COLLABORATOR.
+maintainers: []
+
+# Authors that are never closed by the promotional or linked-issue rules.
+# Bot accounts ([bot] suffix) are always exempt.
+exempt_authors: []
+# Maintainers are exempt too unless this is false (useful for testing).
+exempt_maintainers: true
+
+# A PR carrying any of these labels is never closed by a rule.
+exempt_labels: ["triage: keep open"]
+
+promotional:
+  close_threshold: 0.90 # P(promotional) at or above this closes the PR
+  label_threshold: 0.60 # at or above this (and below close) labels "triage: possible spam"
+  comment: |
+    Thanks for your interest in the project. This pull request looks
+    promotional rather than a change to the project, so it has been closed
+    automatically. If this was a mistake, please reply and a maintainer will
+    take a look.
+
+linked_issue:
+  enabled: true
+  # Also accept a plain "#123" or issue URL in the PR body, not only the
+  # closing keywords ("Fixes #123") and sidebar links GitHub tracks.
+  accept_mentions: true
+  comment: |
+    Thanks for the contribution! This project asks that every pull request
+    be tied to an issue, so this one has been closed automatically. Please
+    open or find an issue describing the problem, then open a new pull
+    request that references it (for example "Fixes #123").
+
+awaiting_author:
+  # P(the latest maintainer messages wait on the author) at or above this
+  # labels "status: needs submitter response".
+  threshold: 0.60
+  # Post one nudge after this many days of waiting. 0 disables nudges.
+  nudge_after_days: 7
+
+ci:
+  # Approve fork workflow runs that wait for maintainer approval when the
+  # decision model judges the change safe.
+  auto_approve: true
+  # Approve only when P(harmful) and P(obfuscated) are both below this.
+  max_risk: 0.10
+  # A diff larger than this is not fully visible to the decision model, so
+  # it is never auto-approved.
+  max_diff_bytes: 24000
+  # A PR that touches any of these paths is never auto-approved. "**"
+  # matches any number of directories.
+  never_approve_paths:
+    - ".github/**"
+
+# Bot accounts whose review threads count as feedback the author may still
+# owe, for example coderabbitai[bot]. The decision model reads their open,
+# unanswered threads next to maintainer comments when it decides whether a
+# PR waits on its author. Other bots are ignored.
+review_bots: []
+
+duplicates:
+  # Compare each PR with older open PRs and recently merged ones. A likely
+  # duplicate gets the label with role: duplicate. It is never closed.
+  enabled: true
+  # P(same change as an earlier PR) at or above this flags it.
+  threshold: 0.80
+  # Earlier PRs with the most overlap (files, title words, a shared issue)
+  # that go to the decision model, at most 15.
+  max_candidates: 8
+  # Also compare with PRs merged in this many days. 0 compares open PRs only.
+  merged_lookback_days: 30
+  # Posted once on a flagged PR; {prs} becomes the earlier PR numbers.
+  # Leave empty to label without commenting.
+  comment: |
+    This pull request looks like it may overlap with {prs}. A maintainer
+    will take a look and decide which one to move forward with.
+
+# The label set. The agent applies only these labels, creates any that are
+# missing, and never touches a label that is not listed.
+#
+# role: marks a label the policy applies itself. Every role below must be on
+# exactly one label, but the name, color and group are yours: rename a label
+# here, or point a role at a label your repo already uses, and the policy
+# follows. Roles: awaiting-author, awaiting-review, possible-spam,
+# ci-needs-review, closed-promotional, closed-no-issue.
+#
+# Optional roles:
+#   ready-for-review  CI green, merges cleanly, nothing open. Without it,
+#                     such PRs get the awaiting-review label.
+#   duplicate         Needed when duplicates.enabled is true. Only ever
+#                     added, never removed, so a human's mark stays.
+#
+# Status, set on every open non-draft PR:
+#   awaiting-author   merge conflicts, failing CI, changes requested, or a
+#                     maintainer or review-bot request still unanswered
+#   awaiting-review   the author answered since the last maintainer
+#                     message, or CI is not green yet
+#   ready-for-review  everything above is clear
+#
+# Quote a name that contains ": ", for example
+#   - {name: "status: needs submitter response", role: awaiting-author, group: status}
+#
+# group: says what the bot may touch. type labels are picked by the decision
+# model (one per PR); area labels are picked by the agent and only ever
+# added; labels in status and triage, and any label with a role, are
+# removed when they no longer apply; any other group is never touched.
+labels:
+  # Type: one per PR, proposed by the decision model.
+  - {name: "type: bug",           group: type, color: d73a4a, description: "Something isn't working as expected"}
+  - {name: "type: enhancement",   group: type, color: a2eeef, description: "New feature or enhancement request"}
+  - {name: "type: documentation", group: type, color: 0075ca, description: "Improvements or additions to documentation"}
+  - {name: "type: chore",         group: type, color: f9d0c4, description: "Maintenance tasks with no user-visible changes"}
+
+  # Area: added by the agent when they clearly fit; never removed.
+  - {name: "area: mcp spec", group: area, color: fbca04, description: "Issues related to MCP specification compliance"}
+  - {name: "area: sdk",      group: area, color: 1d76db, description: "SDK improvements unrelated to MCP specification"}
+
+  # Status: one of the first three on every open, non-draft PR. The
+  # duplicate label is only ever added, never removed.
+  - {name: "status: needs submitter response", role: awaiting-author,  group: status, color: bbbbbb, description: "Waiting for feedback from issue opener"}
+  - {name: "status: need maintainer response", role: awaiting-review,  group: status, color: "999999", description: "Waiting for response from a maintainer"}
+  - {name: "status: ready for review",         role: ready-for-review, group: status, color: 0E8A16, description: "CI green, no blocking feedback — ready for maintainer review"}
+  - {name: "status: duplicate",                role: duplicate,        group: status, color: cfd3d7, description: "This issue or pull request already exists"}
+
+  # Triage: set by the agent's rules.
+  - {name: "triage: possible spam",      role: possible-spam,      group: triage, color: e99695, description: "May be promotional; needs a human"}
+  - {name: "triage: ci needs review",    role: ci-needs-review,    group: triage, color: f9d0c4, description: "CI is waiting for approval and was not auto-approved"}
+  - {name: "triage: closed promotional", role: closed-promotional, group: triage, color: "000000", description: "Closed automatically as promotional"}
+  - {name: "triage: closed no issue",    role: closed-no-issue,    group: triage, color: "000000", description: "Closed automatically for lacking a linked issue"}
+
+  # Manual: never touched by the agent.
+  - {name: "triage: keep open", group: manual, color: 0e8a16, description: "Exempt from automatic closing"}
