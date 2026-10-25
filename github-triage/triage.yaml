@@ -7,6 +7,13 @@
 
 repo: owner/name
 
+# The chat model carries out each PR's plan and writes the comments; the
+# decision model answers the typed questions (promotional? type? whose turn?
+# safe CI? duplicate?). Both are "provider/model"; credentials come from the
+# environment, for example OPENROUTER_API_KEY. The --model flag overrides model.
+model: openrouter/deepseek/deepseek-v4.1-flash-1017
+decision_model: openrouter/typesafe/jev-1.14
+
 # Every 10 minutes. Five-field cron, UTC.
 poll_cron: "*/10 * * * *"
 
@@ -135,9 +142,10 @@ labels:
   - {name: "type: documentation", group: type, color: 0075ca, description: "Improvements or additions to documentation"}
   - {name: "type: chore",         group: type, color: f9d0c4, description: "Maintenance tasks with no user-visible changes"}
 
-  # Area: added by the agent when they clearly fit; never removed.
-  - {name: "area: mcp spec", group: area, color: fbca04, description: "Issues related to MCP specification compliance"}
-  - {name: "area: sdk",      group: area, color: 1d76db, description: "SDK improvements unrelated to MCP specification"}
+  # Area: added by the agent when they clearly fit; never removed. The
+  # description is what the agent goes by, so say which code each covers.
+  # - {name: "area: api",  group: area, color: fbca04, description: "The HTTP API under api/"}
+  # - {name: "area: docs", group: area, color: 1d76db, description: "Documentation under docs/"}
 
   # Status: one of the first three on every open, non-draft PR. The
   # duplicate label is only ever added, never removed.

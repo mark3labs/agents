@@ -62,6 +62,16 @@ count as changes, so it never re-triages itself.
 
 ## Quick start
 
+You need Go and the [BONNIE CLI](https://go-bonnie.dev/installation), a GitHub
+token for the repository (see [Token](#token)), and an
+[OpenRouter](https://openrouter.ai) API key for the default models (or change
+the models, see [Configuration](#configuration)).
+
+```sh
+git clone https://github.com/mark3labs/agents.git
+cd agents/github-triage
+```
+
 1. **Set the repo** in `triage.yaml`:
 
    ```yaml
@@ -82,18 +92,15 @@ count as changes, so it never re-triages itself.
    ./github-triage
    ```
 
-4. **Poll now** instead of waiting for the schedule (run on the same machine):
-
-   ```sh
-   ./github-triage schedules trigger poll-prs
-   ```
-
-5. **Check what it did:**
+4. **Check what it did** after the first poll:
 
    ```sh
    ./github-triage runs                       # one run per triaged PR
-   ./github-triage schedules history poll-prs
+   ./github-triage runs show <run-id>         # what one run did, step by step
    ```
+
+   `runs` reads the journal directly, so it works whether or not the agent is
+   running.
 
 It starts in **dry-run mode**: it works out everything but writes nothing to
 GitHub. Check a few results, then set `dry_run: false` (or
@@ -123,6 +130,8 @@ commented. The ones you're most likely to change:
 
 | Setting | Default | What it does |
 | --- | --- | --- |
+| `model` | `openrouter/deepseek/deepseek-v4.1-flash-1017` | Chat model that carries out the plan and writes comments |
+| `decision_model` | `openrouter/typesafe/jev-1.14` | Decision model for the typed questions |
 | `poll_cron` | `*/10 * * * *` | How often to poll (UTC) |
 | `dry_run` | `true` | Write nothing to GitHub |
 | `linked_issue.enabled` | `true` | Close PRs without a linked issue |
@@ -141,13 +150,12 @@ Environment overrides: `GITHUB_REPO`, `TRIAGE_DRY_RUN`, `TRIAGE_DB` and
 
 ### Default labels
 
-The defaults use the naming scheme of
-[mark3labs/mcp-go](https://github.com/mark3labs/mcp-go/labels) (`type: …`,
-`area: …`, `status: …`), with the same colors and descriptions. Labels that
-already exist in a repo are used as they are. Missing ones (on mcp-go, the four
-`triage: …` labels) are created on the first run that isn't a dry run. The
-`area: …` labels are specific to mcp-go: replace them with your project's areas,
-or remove them.
+The defaults use a `type: …`, `area: …`, `status: …`, `triage: …` naming
+scheme. Labels that already exist in the repo are used as they are; missing
+ones are created on the first run that isn't a dry run. There are no area
+labels by default: add your project's areas in the `area` group, with a
+description that says which code each covers, since that's what the agent
+goes by.
 
 ### Renaming labels
 
@@ -226,12 +234,83 @@ only when:
 
 Anything else gets "triage: ci needs review" for a human.
 
+## HTTP API
+
+The agent serves no HTTP API by default: it only polls GitHub, so nothing
+needs to reach it, and no port is opened. The schedule clock still runs, and
+`runs` still works, because it reads the journal directly.
+
+`bonnie dev`, `chat` and `schedules` (including triggering a poll by hand) need
+the API. For local work, turn it on with `TRIAGE_HTTP_API=true`:
+
+```sh
+TRIAGE_HTTP_API=true ./github-triage --addr 127.0.0.1:8080
+./github-triage schedules trigger poll-prs   # poll now; loopback callers only
+./github-triage schedules history poll-prs
+```
+
+## Run it as a service
+
+[`deploy/github-triage.service`](deploy/github-triage.service) is a sample
+systemd unit. It runs the agent as its own user, restarts it on failure, and
+stops it cleanly: on SIGTERM BONNIE drains the runs in progress, and anything
+cut short resumes from the journal on the next start.
+
+1. **Install the agent** in its own directory, owned by a dedicated user:
+
+   ```sh
+   sudo useradd --system --home /opt/github-triage --shell /usr/sbin/nologin triage
+   sudo mkdir -p /opt/github-triage
+   sudo cp github-triage triage.yaml .env /opt/github-triage/
+   sudo chown -R triage:triage /opt/github-triage
+   sudo chmod 600 /opt/github-triage/.env
+   ```
+
+2. **Install and start the unit:**
+
+   ```sh
+   sudo cp deploy/github-triage.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now github-triage
+   ```
+
+3. **Check on it:**
+
+   ```sh
+   systemctl status github-triage
+   journalctl -u github-triage -f                       # agent log
+   sudo -u triage /opt/github-triage/github-triage runs # triage runs
+   ```
+
+   Run `runs` from inside `/opt/github-triage`, or pass `--journal
+   /opt/github-triage/.bonnie`, so it finds the journal.
+
+**Updating:** copy the new binary over the old one, then
+`sudo systemctl restart github-triage`. Bump `Revision` in `main.go` first if
+the rules changed (see Development).
+
+**A different directory or user:** change `User`, `Group`, `WorkingDirectory`,
+`ExecStart` and `ReadWritePaths` in the unit. If the directory is under
+`/home`, also change `ProtectHome=yes` to `ProtectHome=read-only`, or the
+service can't see its own files.
+
+**Without root:** run it as a user service instead. Copy the unit to
+`~/.config/systemd/user/`, delete the `User=` and `Group=` lines, set the
+paths to your directory, change `WantedBy=` to `default.target`, then:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now github-triage
+sudo loginctl enable-linger "$USER"   # keep it running after you log out
+```
+
 ## Project layout
 
 ```
 main.go               schedule, models, completion check
 instructions.md       the agent's system prompt
 triage.yaml           configuration and label set
+deploy/               sample systemd unit
 internal/triage/      the rules, GitHub client, state store
 tools/<name>/         the seven tools the agent calls (thin wrappers)
 ```
@@ -240,9 +319,12 @@ tools/<name>/         the seven tools the agent calls (thin wrappers)
 
 ```sh
 go test ./...                    # rule tests, using a fake decision model
-bonnie dev                       # hot-reload with a terminal UI
-bonnie dev --schedule-clock      # same, with polling switched on
+TRIAGE_HTTP_API=true bonnie dev                   # hot-reload with a terminal UI
+TRIAGE_HTTP_API=true bonnie dev --schedule-clock  # same, with polling on
 ```
+
+`bonnie dev` talks to the agent over its HTTP API, so it needs
+`TRIAGE_HTTP_API=true`.
 
 When you change the rules or the instructions in a meaningful way, bump
 `Revision` in `main.go`. BONNIE then won't finish an old poll under the new
@@ -257,6 +339,8 @@ rules.
   every poll reads them for every open PR: about three API calls per open PR.
   With 100 open PRs and a 10-minute poll, that's roughly 1,800 of the token's
   5,000 calls per hour.
+- With the API off (the default) there's no way to trigger a poll by hand;
+  the next one runs on the cron. See [HTTP API](#http-api).
 - Questions to a human are switched off. These are background runs, and a run
   waiting on an answer would block every later poll.
 - Comments and closes are safe to retry: before posting, it checks for its own

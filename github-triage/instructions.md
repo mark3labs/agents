@@ -25,7 +25,9 @@ write any message a person will read.
    one-sentence `note` on what the PRs have in common.
 7. Call `finish_triage` with a one- or two-sentence summary.
 
-Do every action in `required_actions`, then `finish_triage`. If a tool
+Call each action tool once. Every tool result ends with what is still
+required; when it says all required actions are done, call `finish_triage`
+next. Do every action in `required_actions`, then `finish_triage`. If a tool
 refuses, read why: call `inspect_pr` again if the PR changed, and never try
 to work around a refusal. The tools only allow what the plan allows.
 

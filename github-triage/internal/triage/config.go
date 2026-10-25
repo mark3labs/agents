@@ -43,8 +43,12 @@ type Label struct {
 
 // Config is triage.yaml after environment overrides.
 type Config struct {
-	Repo          string   `yaml:"repo"`
-	PollCron      string   `yaml:"poll_cron"`
+	Repo     string `yaml:"repo"`
+	PollCron string `yaml:"poll_cron"`
+	// Model is the chat model that carries out the plan and writes comments;
+	// DecisionModel answers the typed questions. Both are "provider/model".
+	Model         string   `yaml:"model"`
+	DecisionModel string   `yaml:"decision_model"`
 	DryRun        bool     `yaml:"dry_run"`
 	MaxPRsPerPoll int      `yaml:"max_prs_per_poll"`
 	StatePath     string   `yaml:"state_path"`
@@ -94,6 +98,12 @@ type Config struct {
 // DefaultPollCron is used when the config cannot be read at startup, so the
 // binary can still print help; the first poll then reports the real error.
 const DefaultPollCron = "*/10 * * * *"
+
+// Default models, used when triage.yaml names none or cannot be read.
+const (
+	DefaultModel         = "openrouter/deepseek/deepseek-v4.1-flash-1017"
+	DefaultDecisionModel = "openrouter/typesafe/jev-1.14"
+)
 
 var (
 	loadOnce sync.Once
@@ -152,6 +162,12 @@ func (c *Config) validate() error {
 	c.owner, c.name = owner, name
 	if c.PollCron == "" {
 		c.PollCron = DefaultPollCron
+	}
+	if c.Model == "" {
+		c.Model = DefaultModel
+	}
+	if c.DecisionModel == "" {
+		c.DecisionModel = DefaultDecisionModel
 	}
 	if c.MaxPRsPerPoll <= 0 {
 		c.MaxPRsPerPoll = 10

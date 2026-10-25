@@ -177,6 +177,11 @@ func SetLabels(ctx context.Context, runID string, pr int, typ string, areas []st
 		remove = append(remove, h)
 	}
 	detail := fmt.Sprintf("add %v, remove %v", add, remove)
+	if len(add) == 0 && len(remove) == 0 {
+		if acts, err := rc.st.Actions(ctx, runID); err == nil && acts[ActionLabels] {
+			return fmt.Sprintf("Labels on #%d are already set; nothing changed. Do not call set_labels again.", pr) + rc.next(ctx, runID), nil
+		}
+	}
 	if !c.DryRun {
 		if err := rc.g.AddLabels(ctx, pr, add); err != nil {
 			return "", err
@@ -190,7 +195,7 @@ func SetLabels(ctx context.Context, runID string, pr int, typ string, areas []st
 	if err := rc.st.RecordAction(ctx, runID, ActionLabels, detail, c.DryRun); err != nil {
 		return "", err
 	}
-	return dry(c, "Labels on #%d: %s.", pr, detail), nil
+	return dry(c, "Labels on #%d: %s.", pr, detail) + rc.next(ctx, runID), nil
 }
 
 // ClosePR posts the configured close comment, plus an optional note from
@@ -229,7 +234,7 @@ func ClosePR(ctx context.Context, runID string, pr int, reason, note string) (st
 	if err := rc.st.RecordAction(ctx, runID, ActionClose, reason, c.DryRun); err != nil {
 		return "", err
 	}
-	return dry(c, "Closed #%d (%s) with comment:\n%s", pr, reason, body), nil
+	return dry(c, "Closed #%d (%s) with comment:\n%s", pr, reason, body) + rc.next(ctx, runID), nil
 }
 
 // ApproveCI approves the plan's pending workflow runs, after checking each
@@ -271,7 +276,7 @@ func ApproveCI(ctx context.Context, runID string, pr int) (string, error) {
 	if err := rc.st.RecordAction(ctx, runID, ActionApprove, detail, c.DryRun); err != nil {
 		return "", err
 	}
-	return dry(c, "Approved CI runs on #%d: %s.", pr, detail), nil
+	return dry(c, "Approved CI runs on #%d: %s.", pr, detail) + rc.next(ctx, runID), nil
 }
 
 // Nudge posts one reminder to the PR author. The agent writes the message;
@@ -301,7 +306,7 @@ func Nudge(ctx context.Context, runID string, pr int, message string) (string, e
 	if err := rc.st.RecordAction(ctx, runID, ActionNudge, message, c.DryRun); err != nil {
 		return "", err
 	}
-	return dry(c, "Nudged #%d:\n%s", pr, message), nil
+	return dry(c, "Nudged #%d:\n%s", pr, message) + rc.next(ctx, runID), nil
 }
 
 // FlagDuplicate posts the configured possible-duplicate comment, with an
@@ -330,7 +335,7 @@ func FlagDuplicate(ctx context.Context, runID string, pr int, note string) (stri
 	if err := rc.st.RecordAction(ctx, runID, ActionDupe, fmt.Sprint(p.DuplicateOf), c.DryRun); err != nil {
 		return "", err
 	}
-	return dry(c, "Flagged #%d as a possible duplicate of %v:\n%s", pr, p.DuplicateOf, body), nil
+	return dry(c, "Flagged #%d as a possible duplicate of %v:\n%s", pr, p.DuplicateOf, body) + rc.next(ctx, runID), nil
 }
 
 // Finish records the triage as done once every required action is recorded.
@@ -373,6 +378,29 @@ func Missing(ctx context.Context, st *Store, runID string, p *Plan) ([]string, e
 		}
 	}
 	return out, nil
+}
+
+// actionTools names the tool that records each action.
+var actionTools = map[string]string{
+	ActionLabels: "set_labels", ActionClose: "close_pr", ActionApprove: "approve_ci",
+	ActionNudge: "nudge_author", ActionDupe: "flag_duplicate",
+}
+
+// next tells the model what is left, so it moves on instead of repeating a
+// finished action. Smaller chat models otherwise call the same tool again.
+func (rc *runCtx) next(ctx context.Context, runID string) string {
+	missing, err := Missing(ctx, rc.st, runID, rc.plan)
+	if err != nil {
+		return ""
+	}
+	if len(missing) == 0 {
+		return "\n\nAll required actions are done. Call finish_triage now."
+	}
+	tools := make([]string, len(missing))
+	for i, m := range missing {
+		tools[i] = actionTools[m]
+	}
+	return "\n\nStill required: " + strings.Join(tools, ", ") + ", then finish_triage."
 }
 
 // commentOnce posts body unless the bot already left a comment with marker

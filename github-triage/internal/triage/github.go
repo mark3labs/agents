@@ -158,7 +158,8 @@ type Thread struct {
 	Comments   struct {
 		Nodes []struct {
 			Author *struct {
-				Login string `json:"login"`
+				Login    string `json:"login"`
+				Typename string `json:"__typename"`
 			} `json:"author"`
 			AuthorAssociation string    `json:"authorAssociation"`
 			Body              string    `json:"body"`
@@ -395,7 +396,7 @@ func (g *GitHub) Graph(ctx context.Context, n int) (*PRGraph, error) {
     pullRequest(number:$number){
       closingIssuesReferences(first:20){nodes{number title state repository{nameWithOwner}}}
       reviewThreads(first:100){nodes{isResolved isOutdated path
-        comments(last:5){nodes{author{login} authorAssociation body createdAt}}}}
+        comments(last:5){nodes{author{login __typename} authorAssociation body createdAt}}}}
       commits(last:1){nodes{commit{committedDate}}}
     }
   }
@@ -435,11 +436,26 @@ func (g *GitHub) Graph(ctx context.Context, n int) (*PRGraph, error) {
 	if pr == nil {
 		return nil, fmt.Errorf("github graphql: PR #%d not found", n)
 	}
-	out := &PRGraph{ClosingIssues: pr.ClosingIssuesReferences.Nodes, Threads: pr.ReviewThreads.Nodes}
+	out := &PRGraph{ClosingIssues: pr.ClosingIssuesReferences.Nodes, Threads: normalizeThreads(pr.ReviewThreads.Nodes)}
 	if len(pr.Commits.Nodes) > 0 {
 		out.LastCommitAt = pr.Commits.Nodes[0].Commit.CommittedDate
 	}
 	return out, nil
+}
+
+// normalizeThreads gives bot authors the login REST uses. GraphQL reports a
+// GitHub App as "coderabbitai" where REST, and so review_bots and IsBot, say
+// "coderabbitai[bot]".
+func normalizeThreads(threads []Thread) []Thread {
+	for i := range threads {
+		for j := range threads[i].Comments.Nodes {
+			a := threads[i].Comments.Nodes[j].Author
+			if a != nil && a.Typename == "Bot" && !strings.HasSuffix(a.Login, "[bot]") {
+				a.Login += "[bot]"
+			}
+		}
+	}
+	return threads
 }
 
 func graphqlURL(base string) string {

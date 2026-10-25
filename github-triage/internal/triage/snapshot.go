@@ -81,11 +81,6 @@ func Fetch(ctx context.Context, c *Config, g *GitHub, n int) (*Snapshot, error) 
 	return s, nil
 }
 
-// FingerprintVersion prefixes every fingerprint. Bump it when Fingerprint
-// changes what it covers: a poll then recomputes every stored fingerprint
-// instead of trusting one made by the old formula.
-const FingerprintVersion = "3"
-
 // IsOwn reports whether a comment is one the triage posted.
 func IsOwn(self string, cm Comment) bool {
 	return cm.User.Login == self && strings.Contains(cm.Body, markerPrefix)
@@ -121,7 +116,7 @@ func Fingerprint(c *Config, self string, pr *PR, comments []Comment, reviews []R
 	}
 	sort.Strings(ids)
 	fmt.Fprintf(h, "%s\n", strings.Join(ids, ","))
-	return FingerprintVersion + ":" + hex.EncodeToString(h.Sum(nil))[:32]
+	return hex.EncodeToString(h.Sum(nil))[:32]
 }
 
 // Combine joins the activity fingerprint with the CI and conflict state.

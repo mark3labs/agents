@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/mark3labs/bonnie/runtime"
@@ -54,7 +53,7 @@ func Prepare(ctx context.Context, fire schedule.Fire) ([]schedule.Dispatch, erro
 		}
 		updated := pr.UpdatedAt.UTC().Format(time.RFC3339)
 		fp := row.Fingerprint
-		if updated != row.UpdatedAt || !strings.HasPrefix(fp, FingerprintVersion+":") {
+		if updated != row.UpdatedAt || fp == "" {
 			// Something changed on GitHub; recompute the fingerprint, which
 			// ignores the bot's own writes.
 			if fp, err = lightFingerprint(ctx, c, g, self, &pr); err != nil {

@@ -1,0 +1,51 @@
+# Sample systemd unit for github-triage. See "Run it as a service" in the
+# README. Replace the user and the paths to match your host.
+#
+# Install:
+#   sudo cp deploy/github-triage.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now github-triage
+
+[Unit]
+Description=github-triage pull request triage agent (BONNIE)
+Documentation=https://go-bonnie.dev
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=triage
+Group=triage
+
+# The agent reads triage.yaml, .env and .bonnie/ from its working directory.
+WorkingDirectory=/opt/github-triage
+ExecStart=/opt/github-triage/github-triage
+
+# BONNIE loads .env from the working directory itself. Point TRIAGE_CONFIG
+# elsewhere here if the config lives outside it.
+#Environment=TRIAGE_CONFIG=/etc/github-triage/triage.yaml
+
+# SIGTERM drains in-flight runs; anything still running is resumed from the
+# journal on the next start, so a stop never loses finished steps.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=10
+
+# Hardening. The agent needs outbound HTTPS (GitHub, the model provider) and
+# write access to its own directory, nothing else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/github-triage
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -466,3 +466,39 @@ func TestSummarizeChecks(t *testing.T) {
 		}
 	}
 }
+
+func TestModelDefaults(t *testing.T) {
+	c := testConfig(t)
+	if c.Model != DefaultModel || c.DecisionModel != DefaultDecisionModel {
+		t.Fatalf("triage.yaml models: %q, %q", c.Model, c.DecisionModel)
+	}
+	c.Model, c.DecisionModel = "", ""
+	if err := c.validate(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Model != DefaultModel || c.DecisionModel != DefaultDecisionModel {
+		t.Fatalf("empty models not defaulted: %q, %q", c.Model, c.DecisionModel)
+	}
+}
+
+func TestGraphQLBotLoginsMatchReviewBots(t *testing.T) {
+	c := testConfig(t)
+	c.ReviewBots = []string{"coderabbitai[bot]"}
+	// GraphQL's shape: no [bot] suffix, __typename Bot.
+	raw := thread(t, `{"isResolved":false,"isOutdated":false,"path":"x.go","comments":{"nodes":[
+		{"author":{"login":"coderabbitai","__typename":"Bot"},"body":"Possible race here.","createdAt":"2026-10-01T00:00:00Z"}]}}`)
+	threads := normalizeThreads([]Thread{raw})
+	if got := threads[0].Comments.Nodes[0].Author.Login; got != "coderabbitai[bot]" {
+		t.Fatalf("login %q", got)
+	}
+	f := &fakeDecide{typ: "type: bug", p: map[string]float64{"awaiting_author": 0.9}}
+	p, _ := Analyze(context.Background(), c, snapshot(func(s *Snapshot) { green(s); s.Graph.Threads = threads }), f.decide, "k")
+	if p.Status != RoleAwaitingAuthor {
+		t.Fatalf("GraphQL-shaped bot thread ignored: status %q, reasons %v", p.Status, p.Reasons)
+	}
+	// A human named like a bot is left alone.
+	h := thread(t, `{"isResolved":false,"comments":{"nodes":[{"author":{"login":"alice","__typename":"User"},"body":"x","createdAt":"2026-10-01T00:00:00Z"}]}}`)
+	if got := normalizeThreads([]Thread{h})[0].Comments.Nodes[0].Author.Login; got != "alice" {
+		t.Fatalf("user login changed to %q", got)
+	}
+}
