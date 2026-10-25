@@ -143,7 +143,27 @@ func Analyze(ctx context.Context, c *Config, s *Snapshot, decide DecideFunc, key
 		}
 	}
 
-	if err := classify(ctx, c, s, decide, keyPrefix, p); err != nil {
+	// Every question for this PR goes into one decision call. Each part adds
+	// its section of the state and its questions, and returns how to apply
+	// the answers; the answers are applied in order afterwards. Questions
+	// whose answers turn out not to matter (CI and duplicates on a PR that
+	// gets closed) cost nothing extra in the same call.
+	b := &batch{}
+	ci := prepareCI(c, s)
+	b.section("Pull request under triage", prSection(c, s, ci))
+	applyClassify := classify(c, p, b)
+	applyAwaiting := awaiting(c, s, p, b)
+	applyCI := ciGate(c, s, p, b, ci)
+	applyDupes := func(*kit.DecisionResult) {}
+	if c.Duplicates.Enabled && !IsBot(pr.User.Login, pr.User.Type) {
+		applyDupes = duplicates(c, s, p, b)
+	}
+	res, err := decide(ctx, b.request(key(keyPrefix, "decide")))
+	if err != nil {
+		return nil, fmt.Errorf("triage: decision: %w", err)
+	}
+
+	if err := applyClassify(res); err != nil {
 		return nil, err
 	}
 	if p.Close == "" && p.Exempt == "" && c.LinkedIssue.Enabled {
@@ -151,16 +171,12 @@ func Analyze(ctx context.Context, c *Config, s *Snapshot, decide DecideFunc, key
 			return nil, err
 		}
 	}
-	if err := awaiting(ctx, c, s, decide, keyPrefix, p); err != nil {
+	if err := applyAwaiting(res); err != nil {
 		return nil, err
 	}
-	if err := ciGate(ctx, c, s, decide, keyPrefix, p); err != nil {
-		return nil, err
-	}
-	if c.Duplicates.Enabled && p.Close == "" && !IsBot(pr.User.Login, pr.User.Type) {
-		if err := duplicates(ctx, c, s, decide, keyPrefix, p); err != nil {
-			return nil, err
-		}
+	applyCI(res)
+	if p.Close == "" {
+		applyDupes(res)
 	}
 
 	if p.Status != "" && p.Close == "" {
@@ -178,62 +194,81 @@ func Analyze(ctx context.Context, c *Config, s *Snapshot, decide DecideFunc, key
 	return p, nil
 }
 
-// classify asks whether the PR is promotional and what type it is.
-func classify(ctx context.Context, c *Config, s *Snapshot, decide DecideFunc, keyPrefix string, p *Plan) error {
-	pr := s.PR
-	diff, _ := s.DiffText(8000)
-	state := fmt.Sprintf("Pull request to %s\nTitle: %s\nAuthor: %s (%s)\n\nDescription:\n%s\n\nChanged files and diff:\n%s",
-		c.Repo, pr.Title, pr.User.Login, strings.ToLower(pr.AuthorAssociation), truncate(pr.Body, 4000), diff)
+// batch collects the sections of one decision state and its questions.
+type batch struct {
+	sections  []string
+	questions []kit.DecisionQuestion
+}
 
+func (b *batch) section(title, body string) {
+	b.sections = append(b.sections, "## "+title+"\n\n"+body)
+}
+
+func (b *batch) ask(q ...kit.DecisionQuestion) { b.questions = append(b.questions, q...) }
+
+func (b *batch) request(key string) bonnie.DecisionRequest {
+	return bonnie.DecisionRequest{
+		State:     kit.DecisionState{Text: strings.Join(b.sections, "\n\n")},
+		Questions: b.questions,
+		Key:       key,
+	}
+}
+
+// prSection describes the PR. When CI may be approved, it carries the
+// complete diff the safety questions need; otherwise an excerpt.
+func prSection(c *Config, s *Snapshot, ci ciPrep) string {
+	pr := s.PR
+	diff := ci.diff
+	if !ci.ask {
+		diff, _ = s.DiffText(8000)
+	}
+	return fmt.Sprintf("Repository: %s\nNumber: #%d\nTitle: %s\nAuthor: %s (%s)\n\nDescription:\n%s\n\nChanged files and diff:\n%s",
+		c.Repo, pr.Number, pr.Title, pr.User.Login, strings.ToLower(pr.AuthorAssociation), truncate(pr.Body, 3000), diff)
+}
+
+// classify asks whether the PR is promotional and what type it is.
+func classify(c *Config, p *Plan, b *batch) func(*kit.DecisionResult) error {
 	var opts []kit.DecisionOption
 	for _, l := range c.TypeLabels() {
 		opts = append(opts, kit.DecisionOption{Name: l.Name, Description: l.Description})
 	}
-	questions := []kit.DecisionQuestion{
-		kit.ChoiceQuestion("type", "Which kind of change is this pull request?", opts...),
-	}
+	b.ask(kit.ChoiceQuestion("type", "Which kind of change is the pull request under triage?", opts...))
 	if p.Exempt == "" {
-		questions = append(questions, kit.BooleanQuestion("promotional",
-			"Is this pull request promotional or spam rather than a genuine contribution? "+
+		b.ask(kit.BooleanQuestion("promotional",
+			"Is the pull request under triage promotional or spam rather than a genuine contribution? "+
 				"Promotional means it mainly advertises a product, service, website, course, company or the author's own project, "+
 				"adds marketing, affiliate, SEO or sponsor links, or makes a trivial or meaningless change to get a link or profile into the repository. "+
 				"A real fix, feature, documentation improvement or dependency update is not promotional, even if it is small."))
 	}
-	res, err := decide(ctx, bonnie.DecisionRequest{
-		State:     kit.DecisionState{Text: state},
-		Questions: questions,
-		Key:       key(keyPrefix, "classify"),
-	})
-	if err != nil {
-		return fmt.Errorf("triage: classify decision: %w", err)
-	}
-	t, err := res.Choice("type")
-	if err != nil {
-		return fmt.Errorf("triage: classify decision: %w", err)
-	}
-	p.ProposedType = t.Choice
-	p.TypeScores = map[string]float64{}
-	for _, d := range t.Distribution {
-		p.TypeScores[d.Name] = round(d.Probability)
-	}
-	if p.Exempt != "" {
-		p.Reasons = append(p.Reasons, "Promotional and linked-issue rules skipped: "+p.Exempt+".")
+	return func(res *kit.DecisionResult) error {
+		t, err := res.Choice("type")
+		if err != nil {
+			return fmt.Errorf("triage: type decision: %w", err)
+		}
+		p.ProposedType = t.Choice
+		p.TypeScores = map[string]float64{}
+		for _, d := range t.Distribution {
+			p.TypeScores[d.Name] = round(d.Probability)
+		}
+		if p.Exempt != "" {
+			p.Reasons = append(p.Reasons, "Promotional and linked-issue rules skipped: "+p.Exempt+".")
+			return nil
+		}
+		a, err := res.Boolean("promotional")
+		if err != nil {
+			return fmt.Errorf("triage: promotional decision: %w", err)
+		}
+		p.Probabilities["promotional"] = round(a.Probability)
+		switch {
+		case a.Probability >= c.Promotional.CloseThreshold:
+			p.Close = ClosePromotional
+			p.Reasons = append(p.Reasons, fmt.Sprintf("P(promotional)=%.2f is at or above %.2f: close.", a.Probability, c.Promotional.CloseThreshold))
+		case a.Probability >= c.Promotional.LabelThreshold:
+			p.HostLabels = append(p.HostLabels, c.RoleLabel(RolePossibleSpam))
+			p.Reasons = append(p.Reasons, fmt.Sprintf("P(promotional)=%.2f is borderline: label %s for a human.", a.Probability, c.RoleLabel(RolePossibleSpam)))
+		}
 		return nil
 	}
-	a, err := res.Boolean("promotional")
-	if err != nil {
-		return fmt.Errorf("triage: classify decision: %w", err)
-	}
-	p.Probabilities["promotional"] = round(a.Probability)
-	switch {
-	case a.Probability >= c.Promotional.CloseThreshold:
-		p.Close = ClosePromotional
-		p.Reasons = append(p.Reasons, fmt.Sprintf("P(promotional)=%.2f is at or above %.2f: close.", a.Probability, c.Promotional.CloseThreshold))
-	case a.Probability >= c.Promotional.LabelThreshold:
-		p.HostLabels = append(p.HostLabels, c.RoleLabel(RolePossibleSpam))
-		p.Reasons = append(p.Reasons, fmt.Sprintf("P(promotional)=%.2f is borderline: label %s for a human.", a.Probability, c.RoleLabel(RolePossibleSpam)))
-	}
-	return nil
 }
 
 var (
@@ -325,11 +360,11 @@ func mentionedIssues(ctx context.Context, c *Config, s *Snapshot) ([]string, err
 // last maintainer message or CI is not green yet, and "ready for review"
 // (if that role is configured) when CI is green, it merges cleanly and
 // nothing is open. It also decides whether a nudge is due.
-func awaiting(ctx context.Context, c *Config, s *Snapshot, decide DecideFunc, keyPrefix string, p *Plan) error {
+func awaiting(c *Config, s *Snapshot, p *Plan, b *batch) func(*kit.DecisionResult) error {
 	pr := s.PR
 	if pr.Draft {
 		p.Reasons = append(p.Reasons, "Draft: no status label.")
-		return nil
+		return func(*kit.DecisionResult) error { return nil }
 	}
 	author := pr.User.Login
 	isMaint := func(login, assoc string) bool {
@@ -434,91 +469,92 @@ func awaiting(ctx context.Context, c *Config, s *Snapshot, decide DecideFunc, ke
 		waitFrom(s.Merge.FailedAt)
 	}
 
-	waiting := len(blocking) > 0
-	for _, b := range blocking {
-		p.Reasons = append(p.Reasons, "Waiting on the author: "+b+".")
+	asked := !changesRequested && len(msgs) > 0
+	if asked {
+		b.section("Open messages to the author", fmt.Sprintf(
+			"The author (%s) was last active at %s. Messages from maintainers and automated reviewers since then, "+
+				"and review threads still open:\n\n%s",
+			author, since.Format(time.RFC3339), truncate(strings.Join(msgs, "\n\n"), 12000)))
+		b.ask(kit.BooleanQuestion("awaiting_author",
+			"Do the messages in \"Open messages to the author\" ask the pull request author a question, ask them to make "+
+				"a change, or point out a problem they still have to fix, so that the next step is the author's? "+
+				"Approval, thanks, optional nitpicks, or notes between maintainers are not."))
 	}
-	switch {
-	case changesRequested:
-		waiting = true
-		p.Probabilities["awaiting_author"] = 1
-		p.Reasons = append(p.Reasons, "A maintainer requested changes after the author's last activity.")
-	case len(msgs) > 0:
-		state := fmt.Sprintf("Pull request #%d by %s: %s\n\nThe author's last activity was at %s. "+
-			"Open messages from maintainers and automated reviewers:\n\n%s",
-			pr.Number, author, pr.Title, since.Format(time.RFC3339), strings.Join(msgs, "\n\n"))
-		res, err := decide(ctx, bonnie.DecisionRequest{
-			State: kit.DecisionState{Text: truncate(state, 24000)},
-			Questions: []kit.DecisionQuestion{kit.BooleanQuestion("awaiting_author",
-				"Do these messages ask the pull request author a question, ask them to make a change, or point out a problem "+
-					"they still have to fix, so that the next step is the author's? Approval, thanks, optional nitpicks, "+
-					"or notes between maintainers are not.")},
-			Key: key(keyPrefix, "awaiting"),
-		})
-		if err != nil {
-			return fmt.Errorf("triage: awaiting-author decision: %w", err)
+	return func(res *kit.DecisionResult) error {
+		waiting := len(blocking) > 0
+		for _, b := range blocking {
+			p.Reasons = append(p.Reasons, "Waiting on the author: "+b+".")
 		}
-		a, err := res.Boolean("awaiting_author")
-		if err != nil {
-			return fmt.Errorf("triage: awaiting-author decision: %w", err)
-		}
-		p.Probabilities["awaiting_author"] = round(a.Probability)
-		if a.Probability >= c.AwaitingAuthor.Threshold {
-			waiting = true
-		}
-		p.Reasons = append(p.Reasons, fmt.Sprintf("P(awaiting author)=%.2f over %d open message(s), %d from review bots.",
-			a.Probability, len(msgs), botThreads))
-	}
-
-	if !waiting {
-		ready := c.RoleLabel(RoleReadyForReview) != ""
 		switch {
-		case !lastMaint.IsZero() && since.After(lastMaint):
-			p.Status = RoleAwaitingReview
-			p.Reasons = append(p.Reasons, "The author responded after the last maintainer message.")
-		case ready && s.Merge.Green():
-			p.Status = RoleReadyForReview
-			p.Reasons = append(p.Reasons, "CI is green, it merges cleanly and nothing is open.")
-		default:
-			p.Status = RoleAwaitingReview
-			if ready {
-				p.Reasons = append(p.Reasons, fmt.Sprintf("Not ready for review yet: CI is %s.", s.Merge.CI))
+		case changesRequested:
+			waiting = true
+			p.Probabilities["awaiting_author"] = 1
+			p.Reasons = append(p.Reasons, "A maintainer requested changes after the author's last activity.")
+		case asked:
+			a, err := res.Boolean("awaiting_author")
+			if err != nil {
+				return fmt.Errorf("triage: awaiting-author decision: %w", err)
+			}
+			p.Probabilities["awaiting_author"] = round(a.Probability)
+			if a.Probability >= c.AwaitingAuthor.Threshold {
+				waiting = true
+			}
+			p.Reasons = append(p.Reasons, fmt.Sprintf("P(awaiting author)=%.2f over %d open message(s), %d from review bots.",
+				a.Probability, len(msgs), botThreads))
+		}
+
+		if !waiting {
+			ready := c.RoleLabel(RoleReadyForReview) != ""
+			switch {
+			case !lastMaint.IsZero() && since.After(lastMaint):
+				p.Status = RoleAwaitingReview
+				p.Reasons = append(p.Reasons, "The author responded after the last maintainer message.")
+			case ready && s.Merge.Green():
+				p.Status = RoleReadyForReview
+				p.Reasons = append(p.Reasons, "CI is green, it merges cleanly and nothing is open.")
+			default:
+				p.Status = RoleAwaitingReview
+				if ready {
+					p.Reasons = append(p.Reasons, fmt.Sprintf("Not ready for review yet: CI is %s.", s.Merge.CI))
+				}
+			}
+			return nil
+		}
+		p.Status = RoleAwaitingAuthor
+		if first.IsZero() {
+			first = time.Now()
+		}
+		p.AwaitingSince = first.UTC().Format(time.RFC3339)
+		days := c.AwaitingAuthor.NudgeAfterDays
+		if days <= 0 || time.Since(first) < time.Duration(days)*24*time.Hour {
+			return nil
+		}
+		for _, cm := range s.IssueComments {
+			if cm.User.Login == s.Self && strings.Contains(cm.Body, MarkerNudge) && cm.CreatedAt.After(first) {
+				p.LastNudge = cm.CreatedAt.UTC().Format(time.RFC3339)
+				return nil // already nudged for this wait
 			}
 		}
+		p.Nudge = true
+		p.Reasons = append(p.Reasons, fmt.Sprintf("Waiting on the author for more than %d days: nudge once.", days))
 		return nil
 	}
-	p.Status = RoleAwaitingAuthor
-	if first.IsZero() {
-		first = time.Now()
-	}
-	p.AwaitingSince = first.UTC().Format(time.RFC3339)
-	days := c.AwaitingAuthor.NudgeAfterDays
-	if days <= 0 || time.Since(first) < time.Duration(days)*24*time.Hour {
-		return nil
-	}
-	for _, cm := range s.IssueComments {
-		if cm.User.Login == s.Self && strings.Contains(cm.Body, MarkerNudge) && cm.CreatedAt.After(first) {
-			p.LastNudge = cm.CreatedAt.UTC().Format(time.RFC3339)
-			return nil // already nudged for this wait
-		}
-	}
-	p.Nudge = true
-	p.Reasons = append(p.Reasons, fmt.Sprintf("Waiting on the author for more than %d days: nudge once.", days))
-	return nil
 }
 
-// ciGate decides which pending workflow runs to approve.
-func ciGate(ctx context.Context, c *Config, s *Snapshot, decide DecideFunc, keyPrefix string, p *Plan) error {
-	if len(s.PendingRuns) == 0 || p.Close != "" {
-		return nil
-	}
-	needsReview := func(why string) error {
-		p.HostLabels = append(p.HostLabels, c.RoleLabel(RoleCINeedsReview))
-		p.Reasons = append(p.Reasons, "CI waits for approval and was not auto-approved: "+why)
-		return nil
+// ciPrep is the deterministic half of the CI gate: whether the safety
+// questions can be asked, and if not, why the runs need a human.
+type ciPrep struct {
+	ask    bool
+	diff   string
+	review string
+}
+
+func prepareCI(c *Config, s *Snapshot) ciPrep {
+	if len(s.PendingRuns) == 0 {
+		return ciPrep{}
 	}
 	if !c.CI.AutoApprove {
-		return needsReview("ci.auto_approve is off.")
+		return ciPrep{review: "ci.auto_approve is off."}
 	}
 	var blocked []string
 	for _, f := range s.Files {
@@ -527,45 +563,58 @@ func ciGate(ctx context.Context, c *Config, s *Snapshot, decide DecideFunc, keyP
 		}
 	}
 	if len(blocked) > 0 {
-		return needsReview("touches " + strings.Join(blocked, ", ") + " (ci.never_approve_paths).")
+		return ciPrep{review: "touches " + strings.Join(blocked, ", ") + " (ci.never_approve_paths)."}
 	}
 	diff, complete := s.DiffText(c.CI.MaxDiffBytes)
 	if !complete {
-		return needsReview(fmt.Sprintf("the diff is larger than ci.max_diff_bytes (%d) or has files without patches.", c.CI.MaxDiffBytes))
+		return ciPrep{review: fmt.Sprintf("the diff is larger than ci.max_diff_bytes (%d) or has files without patches.", c.CI.MaxDiffBytes)}
 	}
-	state := fmt.Sprintf("A pull request from an outside contributor wants to run this repository's CI on its code.\n"+
-		"Title: %s\nAuthor: %s\n\nDescription:\n%s\n\nComplete diff:\n%s",
-		s.PR.Title, s.PR.User.Login, truncate(s.PR.Body, 2000), diff)
-	res, err := decide(ctx, bonnie.DecisionRequest{
-		State: kit.DecisionState{Text: state},
-		Questions: []kit.DecisionQuestion{
-			kit.BooleanQuestion("harmful",
-				"Could running this change in CI be harmful? For example: reading or sending secrets, tokens or environment variables; "+
-					"network calls to unknown hosts; downloading and running remote code; crypto mining; changing build, install or test "+
-					"scripts to run unexpected commands; or abusing the CI runner."),
-			kit.BooleanQuestion("obfuscated",
-				"Does the change contain obfuscated, encoded, minified or otherwise hard-to-read code or data whose purpose is unclear?"),
-		},
-		Key: key(keyPrefix, "ci"),
-	})
-	if err != nil {
-		// Fail closed: no answer, no approval.
-		return needsReview("the safety decision failed: " + err.Error())
+	return ciPrep{ask: true, diff: diff}
+}
+
+// ciGate decides which pending workflow runs to approve.
+func ciGate(c *Config, s *Snapshot, p *Plan, b *batch, ci ciPrep) func(*kit.DecisionResult) {
+	if ci.ask {
+		b.ask(
+			kit.BooleanQuestion("ci_harmful",
+				"The pull request under triage comes from an outside contributor and wants to run this repository's CI. "+
+					"Judging by its complete diff, could running it in CI be harmful? For example: reading or sending secrets, "+
+					"tokens or environment variables; network calls to unknown hosts; downloading and running remote code; "+
+					"crypto mining; changing build, install or test scripts to run unexpected commands; or abusing the CI runner."),
+			kit.BooleanQuestion("ci_obfuscated",
+				"Does the diff of the pull request under triage contain obfuscated, encoded, minified or otherwise "+
+					"hard-to-read code or data whose purpose is unclear?"),
+		)
 	}
-	harm, err1 := res.Boolean("harmful")
-	obf, err2 := res.Boolean("obfuscated")
-	if err := errors.Join(err1, err2); err != nil {
-		return needsReview("the safety decision failed: " + err.Error())
+	return func(res *kit.DecisionResult) {
+		if len(s.PendingRuns) == 0 || p.Close != "" {
+			return
+		}
+		needsReview := func(why string) {
+			p.HostLabels = append(p.HostLabels, c.RoleLabel(RoleCINeedsReview))
+			p.Reasons = append(p.Reasons, "CI waits for approval and was not auto-approved: "+why)
+		}
+		if !ci.ask {
+			needsReview(ci.review)
+			return
+		}
+		harm, err1 := res.Boolean("ci_harmful")
+		obf, err2 := res.Boolean("ci_obfuscated")
+		if err := errors.Join(err1, err2); err != nil {
+			// Fail closed: no answer, no approval.
+			needsReview("the safety decision failed: " + err.Error())
+			return
+		}
+		p.Probabilities["ci_harmful"] = round(harm.Probability)
+		p.Probabilities["ci_obfuscated"] = round(obf.Probability)
+		if harm.Probability >= c.CI.MaxRisk || obf.Probability >= c.CI.MaxRisk {
+			needsReview(fmt.Sprintf("P(harmful)=%.2f, P(obfuscated)=%.2f, limit %.2f.", harm.Probability, obf.Probability, c.CI.MaxRisk))
+			return
+		}
+		p.ApproveRuns = append(p.ApproveRuns, p.PendingRuns...)
+		p.Reasons = append(p.Reasons, fmt.Sprintf("CI judged safe (P(harmful)=%.2f, P(obfuscated)=%.2f): approve %d run(s).",
+			harm.Probability, obf.Probability, len(p.ApproveRuns)))
 	}
-	p.Probabilities["ci_harmful"] = round(harm.Probability)
-	p.Probabilities["ci_obfuscated"] = round(obf.Probability)
-	if harm.Probability >= c.CI.MaxRisk || obf.Probability >= c.CI.MaxRisk {
-		return needsReview(fmt.Sprintf("P(harmful)=%.2f, P(obfuscated)=%.2f, limit %.2f.", harm.Probability, obf.Probability, c.CI.MaxRisk))
-	}
-	p.ApproveRuns = append(p.ApproveRuns, p.PendingRuns...)
-	p.Reasons = append(p.Reasons, fmt.Sprintf("CI judged safe (P(harmful)=%.2f, P(obfuscated)=%.2f): approve %d run(s).",
-		harm.Probability, obf.Probability, len(p.ApproveRuns)))
-	return nil
 }
 
 // key builds a decision key; with no prefix the call is not keyed.

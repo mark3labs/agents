@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mark3labs/bonnie"
 	kit "github.com/mark3labs/kit/pkg/kit"
 )
 
@@ -189,69 +188,53 @@ func shortlist(s *Snapshot, others []Candidate, max int) []Candidate {
 	return out
 }
 
-// duplicates asks the decision model whether the PR duplicates any
-// shortlisted older or merged PR, and labels it for a human if so.
-func duplicates(ctx context.Context, c *Config, s *Snapshot, decide DecideFunc, keyPrefix string, p *Plan) error {
+// duplicates asks whether the PR duplicates any shortlisted older or
+// merged PR, and labels it for a human if so.
+func duplicates(c *Config, s *Snapshot, p *Plan, b *batch) func(*kit.DecisionResult) {
 	cands := shortlist(s, s.Others, c.Duplicates.MaxCandidates)
 	if len(cands) == 0 {
-		return nil
+		return func(*kit.DecisionResult) {}
 	}
-	describe := func(n int, title, body string, files []string, extra string) string {
+	var text strings.Builder
+	for _, o := range cands {
+		status := "open"
+		if o.Merged {
+			status = "already merged"
+		}
+		files := o.Files
 		if len(files) > 30 {
 			files = append(files[:30:30], fmt.Sprintf("... and %d more", len(files)-30))
 		}
-		return fmt.Sprintf("#%d%s: %s\n%s\nFiles: %s", n, extra, title, truncate(body, 800), strings.Join(files, ", "))
+		fmt.Fprintf(&text, "#%d (%s): %s\n%s\nFiles: %s\n\n", o.Number, status, o.Title, truncate(o.Body, 600), strings.Join(files, ", "))
+		b.ask(kit.BooleanQuestion(fmt.Sprintf("dup_%d", o.Number), fmt.Sprintf(
+			"Does the pull request under triage make the same change or fix the same problem as earlier pull request #%d, "+
+				"so that only one of them should be merged? Touching the same files for a different reason is not a duplicate.", o.Number)))
 	}
-	var paths []string
-	for _, f := range s.Files {
-		paths = append(paths, f.Filename)
-	}
-	var b strings.Builder
-	b.WriteString("Pull request under triage:\n")
-	b.WriteString(describe(s.PR.Number, s.PR.Title, s.PR.Body, paths, ""))
-	b.WriteString("\n\nEarlier pull requests:\n")
-	var questions []kit.DecisionQuestion
-	for _, o := range cands {
-		extra := " (open)"
-		if o.Merged {
-			extra = " (already merged)"
+	b.section("Earlier pull requests", truncate(text.String(), 12000))
+
+	return func(res *kit.DecisionResult) {
+		for _, o := range cands {
+			// A refused or missing answer is not a duplicate: the check is advisory.
+			a, err := res.Boolean(fmt.Sprintf("dup_%d", o.Number))
+			if err != nil {
+				continue
+			}
+			p.Probabilities[fmt.Sprintf("duplicate_of_%d", o.Number)] = round(a.Probability)
+			if a.Probability >= c.Duplicates.Threshold {
+				p.DuplicateOf = append(p.DuplicateOf, o.Number)
+			}
 		}
-		b.WriteString("\n" + describe(o.Number, o.Title, o.Body, o.Files, extra) + "\n")
-		questions = append(questions, kit.BooleanQuestion(fmt.Sprintf("dup_%d", o.Number), fmt.Sprintf(
-			"Does #%d make the same change or fix the same problem as #%d, so that only one of them should be merged? "+
-				"Touching the same files for a different reason is not a duplicate.", s.PR.Number, o.Number)))
-	}
-	res, err := decide(ctx, bonnie.DecisionRequest{
-		State:     kit.DecisionState{Text: truncate(b.String(), 24000)},
-		Questions: questions,
-		Key:       key(keyPrefix, "duplicates"),
-	})
-	if err != nil {
-		// A duplicate check is advisory: note the failure, do not stop the triage.
-		p.Reasons = append(p.Reasons, "Duplicate check failed: "+err.Error())
-		return nil
-	}
-	for _, o := range cands {
-		a, err := res.Boolean(fmt.Sprintf("dup_%d", o.Number))
-		if err != nil {
-			continue
+		if len(p.DuplicateOf) == 0 {
+			return
 		}
-		p.Probabilities[fmt.Sprintf("duplicate_of_%d", o.Number)] = round(a.Probability)
-		if a.Probability >= c.Duplicates.Threshold {
-			p.DuplicateOf = append(p.DuplicateOf, o.Number)
+		refs := make([]string, len(p.DuplicateOf))
+		for i, n := range p.DuplicateOf {
+			refs[i] = "#" + itoa(n)
+		}
+		p.HostLabels = append(p.HostLabels, c.RoleLabel(RoleDuplicate))
+		p.Reasons = append(p.Reasons, "Possible duplicate of "+strings.Join(refs, ", ")+": labelled for a maintainer to confirm.")
+		if t := strings.TrimSpace(c.Duplicates.Comment); t != "" {
+			p.DuplicateComment = strings.ReplaceAll(t, "{prs}", strings.Join(refs, ", ")) + "\n\n" + MarkerDuplicate
 		}
 	}
-	if len(p.DuplicateOf) == 0 {
-		return nil
-	}
-	refs := make([]string, len(p.DuplicateOf))
-	for i, n := range p.DuplicateOf {
-		refs[i] = "#" + itoa(n)
-	}
-	p.HostLabels = append(p.HostLabels, c.RoleLabel(RoleDuplicate))
-	p.Reasons = append(p.Reasons, "Possible duplicate of "+strings.Join(refs, ", ")+": labelled for a maintainer to confirm.")
-	if t := strings.TrimSpace(c.Duplicates.Comment); t != "" {
-		p.DuplicateComment = strings.ReplaceAll(t, "{prs}", strings.Join(refs, ", ")) + "\n\n" + MarkerDuplicate
-	}
-	return nil
 }

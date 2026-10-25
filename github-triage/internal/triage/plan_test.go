@@ -36,12 +36,16 @@ func testConfig(t *testing.T) *Config {
 
 // fakeDecide answers by question ID and records the questions it saw.
 type fakeDecide struct {
-	p    map[string]float64
-	typ  string
-	seen []string
+	p     map[string]float64
+	typ   string
+	seen  []string
+	calls int
+	state string
 }
 
 func (f *fakeDecide) decide(_ context.Context, req bonnie.DecisionRequest) (*kit.DecisionResult, error) {
+	f.calls++
+	f.state = req.State.Text
 	res := &kit.DecisionResult{}
 	for _, q := range req.Questions {
 		f.seen = append(f.seen, q.ID)
@@ -186,13 +190,13 @@ func TestCIGate(t *testing.T) {
 	c := testConfig(t)
 	pending := func(s *Snapshot) { s.PendingRuns = []WorkflowRun{{ID: 99, HeadSHA: "abc123"}} }
 
-	f := &fakeDecide{typ: "type: bug", p: map[string]float64{"harmful": 0.01, "obfuscated": 0.02}}
+	f := &fakeDecide{typ: "type: bug", p: map[string]float64{"ci_harmful": 0.01, "ci_obfuscated": 0.02}}
 	p, _ := Analyze(context.Background(), c, snapshot(pending), f.decide, "k")
 	if !slices.Equal(p.ApproveRuns, []int64{99}) {
 		t.Fatalf("safe PR not approved: %+v", p)
 	}
 
-	f = &fakeDecide{typ: "type: bug", p: map[string]float64{"harmful": 0.4}}
+	f = &fakeDecide{typ: "type: bug", p: map[string]float64{"ci_harmful": 0.4}}
 	p, _ = Analyze(context.Background(), c, snapshot(pending), f.decide, "k")
 	if len(p.ApproveRuns) > 0 || !slices.Contains(p.HostLabels, "triage: ci needs review") {
 		t.Fatalf("risky PR approved: %+v", p)
@@ -204,7 +208,7 @@ func TestCIGate(t *testing.T) {
 		s.Files = append(s.Files, File{Filename: ".github/workflows/ci.yml", Additions: 1, Patch: "+x"})
 		s.PR.ChangedFiles = 2
 	}), f.decide, "k")
-	if len(p.ApproveRuns) > 0 || slices.Contains(f.seen, "harmful") {
+	if len(p.ApproveRuns) > 0 || slices.Contains(f.seen, "ci_harmful") {
 		t.Fatalf("workflow change approved or asked: %+v seen=%v", p, f.seen)
 	}
 }
@@ -500,5 +504,46 @@ func TestGraphQLBotLoginsMatchReviewBots(t *testing.T) {
 	h := thread(t, `{"isResolved":false,"comments":{"nodes":[{"author":{"login":"alice","__typename":"User"},"body":"x","createdAt":"2026-10-01T00:00:00Z"}]}}`)
 	if got := normalizeThreads([]Thread{h})[0].Comments.Nodes[0].Author.Login; got != "alice" {
 		t.Fatalf("user login changed to %q", got)
+	}
+}
+
+func TestOneDecisionCallPerPR(t *testing.T) {
+	c := testConfig(t)
+	c.ReviewBots = []string{"coderabbitai[bot]"}
+	now := time.Now()
+	f := &fakeDecide{typ: "type: bug", p: map[string]float64{"awaiting_author": 0.9, "ci_harmful": 0.01, "ci_obfuscated": 0.01, "dup_3": 0.95}}
+	p, err := Analyze(context.Background(), c, snapshot(func(s *Snapshot) {
+		s.PendingRuns = []WorkflowRun{{ID: 99, HeadSHA: "abc123"}}
+		s.IssueComments = []Comment{{ID: 1, User: User{Login: "maint"}, AuthorAssociation: "MEMBER", Body: "Please add a test.", CreatedAt: now.Add(-time.Hour)}}
+		s.Others = []Candidate{{Number: 3, Title: "fix(store): crash on empty list", Files: []string{"store/list.go"}, CreatedAt: now.Add(-60 * 24 * time.Hour)}}
+	}), f.decide, "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.calls != 1 {
+		t.Fatalf("%d decision calls, want 1", f.calls)
+	}
+	for _, q := range []string{"type", "promotional", "awaiting_author", "ci_harmful", "ci_obfuscated", "dup_3"} {
+		if !slices.Contains(f.seen, q) {
+			t.Errorf("question %q not asked; asked %v", q, f.seen)
+		}
+	}
+	for _, sec := range []string{"## Pull request under triage", "## Open messages to the author", "## Earlier pull requests"} {
+		if !strings.Contains(f.state, sec) {
+			t.Errorf("state lacks section %q", sec)
+		}
+	}
+	if p.Status != RoleAwaitingAuthor || len(p.ApproveRuns) != 1 || !slices.Equal(p.DuplicateOf, []int{3}) {
+		t.Fatalf("answers not all applied: status=%q approve=%v dup=%v", p.Status, p.ApproveRuns, p.DuplicateOf)
+	}
+
+	// A promotional close still makes one call and ignores the CI and duplicate answers.
+	f = &fakeDecide{typ: "type: docs", p: map[string]float64{"promotional": 0.99, "ci_harmful": 0.01, "ci_obfuscated": 0.01, "dup_3": 0.95}}
+	p, _ = Analyze(context.Background(), c, snapshot(func(s *Snapshot) {
+		s.PendingRuns = []WorkflowRun{{ID: 99, HeadSHA: "abc123"}}
+		s.Others = []Candidate{{Number: 3, Title: "fix(store): crash on empty list", Files: []string{"store/list.go"}, CreatedAt: now.Add(-60 * 24 * time.Hour)}}
+	}), f.decide, "k")
+	if f.calls != 1 || p.Close != ClosePromotional || len(p.ApproveRuns) > 0 || len(p.DuplicateOf) > 0 {
+		t.Fatalf("closing PR: calls=%d close=%q approve=%v dup=%v", f.calls, p.Close, p.ApproveRuns, p.DuplicateOf)
 	}
 }

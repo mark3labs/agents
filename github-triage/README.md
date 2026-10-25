@@ -52,8 +52,9 @@ and journalled:
 | Could running this in CI be harmful? Is it obfuscated? | Approve CI only if both are below 0.10 |
 | Does this PR make the same change as earlier PR #N? | "status: duplicate" at P ≥ 0.80 |
 
-Merge conflicts and CI results come straight from GitHub, with no model
-involved.
+All of a PR's questions go to the decision model in a single call, so
+each triaged PR costs one decision request. Merge conflicts and CI results
+come straight from GitHub, with no model involved.
 
 **State.** A small SQLite file (`.bonnie/triage.db`) remembers what each PR
 looked like when it was last triaged: its commit, its comments and reviews, its
