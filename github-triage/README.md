@@ -78,11 +78,13 @@ cd agents/github-triage
    repo: your-org/your-repo
    ```
 
-2. **Set credentials** in the environment or `.env`:
+2. **Set credentials:** copy `.env.example` to `.env` and fill in the two
+   required values. It also lists the optional overrides.
 
    ```sh
-   GITHUB_TOKEN=...        # see "Token" below
-   OPENROUTER_API_KEY=...  # chat model and decision model
+   cp .env.example .env
+   # GITHUB_TOKEN=...        see "Token" below
+   # OPENROUTER_API_KEY=...  chat model and decision model
    ```
 
 3. **Build and run:**
