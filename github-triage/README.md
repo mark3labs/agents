@@ -152,6 +152,14 @@ commented. The ones you're most likely to change:
 Environment overrides: `GITHUB_REPO`, `TRIAGE_DRY_RUN`, `TRIAGE_DB` and
 `TRIAGE_CONFIG` (the config file path).
 
+**Models.** `model` and `decision_model` are `provider/model` strings, and
+each needs its provider's key in the environment. They don't have to share a
+provider, but the decision model must come from one that serves decision
+models: OpenRouter, Vercel's AI Gateway, Cloudflare Workers AI, or a local
+Ollama. So you can move the chat model to, say, Anthropic and keep
+`decision_model` on OpenRouter. `kit update-models` refreshes the list of
+decision models BONNIE knows about.
+
 ### Default labels
 
 The defaults use a `type: …`, `area: …`, `status: …`, `triage: …` naming
